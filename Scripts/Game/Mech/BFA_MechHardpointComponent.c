@@ -1114,8 +1114,10 @@ class BFA_MechHardpointComponent : ScriptComponent
 				w0 = (w0 & ~mask) | (moduleId << shift);
 			else if (wordIndex == 1)
 				w1 = (w1 & ~mask) | (moduleId << shift);
-			else
-				w2 = (w2 & ~mask) | (moduleId << shift);
+			else if (wordIndex == 2) w2 = (w2 & ~mask) | (moduleId << shift);
+			else if (wordIndex == 3) w3 = (w3 & ~mask) | (moduleId << shift);
+			else if (wordIndex == 4) w4 = (w4 & ~mask) | (moduleId << shift);
+			else w5 = (w5 & ~mask) | (moduleId << shift);
 		}
 
 		return ServerBeginSwap(stationId, w0, w1, w2, w3, w4, w5, -1);
