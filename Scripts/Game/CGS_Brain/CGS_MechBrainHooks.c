@@ -5,16 +5,106 @@
 modded class BFA_MechAICrewComponent
 {
 	protected CGS_MechBrainComponent m_pCgsBrain;
-	protected bool m_bCgsBrainLooked;
+	protected bool m_bCgsPlayerDriving;
+	protected float m_fCgsCompanionDiagTimer;
+	// Companion FOLLOW hysteresis and input smoothing are local to the server AI driver.
+	// Ordinary autonomous patrol/hunt/combat steering remains unchanged.
+	protected bool m_bCgsFollowMoving;
+	protected float m_fCgsFollowForward;
+	protected float m_fCgsFollowTurn;
+	// Short-range steering around world obstacles during companion FOLLOW.
+	// This is a local avoidance layer, not long-range navmesh routing.
+	protected int m_iCgsFollowAvoidSide;
+	protected float m_fCgsFollowAvoidTime;
+	protected bool m_bCgsFollowAvoidEnabled = true;
+	protected float m_fCgsFollowObstacleRange = 13.0;
+
+	protected float CgsFollowClearance(vector origin, vector direction, float range)
+	{
+		BaseWorld world = GetGame().GetWorld();
+		if (!world)
+			return range;
+		direction[1] = 0;
+		if (direction.LengthSq() < 0.001)
+			return 0;
+		direction.Normalize();
+		TraceParam trace = new TraceParam();
+		trace.Start = origin + Vector(0, 2.0, 0);
+		trace.End = trace.Start + direction * range;
+		trace.Flags = TraceFlags.WORLD | TraceFlags.ENTS;
+		trace.Exclude = GetOwner();
+		trace.LayerMask = EPhysicsLayerPresets.Projectile;
+		return range * world.TraceMove(trace, null);
+	}
+
+	protected vector CgsFollowAvoidObstacle(vector position, vector toTarget, float dt)
+	{
+		if (!m_bCgsFollowAvoidEnabled || toTarget.LengthSq() < 1)
+			return toTarget;
+
+		float range = Math.Max(m_fCgsFollowObstacleRange, 6.0);
+		vector ahead = toTarget.Normalized();
+		float straight = CgsFollowClearance(position, ahead, range);
+		m_fCgsFollowAvoidTime = Math.Max(m_fCgsFollowAvoidTime - dt, 0);
+		if (straight >= range * 0.9 && m_fCgsFollowAvoidTime <= 0)
+		{
+			m_iCgsFollowAvoidSide = 0;
+			return toTarget;
+		}
+		// Compare forward-diagonal directions (approximately 45 degrees).
+		vector right = Vector(ahead[2], 0, -ahead[0]);
+		vector leftDir = (ahead + right).Normalized();
+		vector rightDir = (ahead - right).Normalized();
+		float leftClear = CgsFollowClearance(position, leftDir, range);
+		float rightClear = CgsFollowClearance(position, rightDir, range);
+
+		int side = m_iCgsFollowAvoidSide;
+		if (side == 0 || m_fCgsFollowAvoidTime <= 0)
+		{
+			if (leftClear > rightClear + 0.6)
+				side = 1;
+			else
+				side = -1;
+			m_iCgsFollowAvoidSide = side;
+			m_fCgsFollowAvoidTime = 1.5;
+		}
+
+		vector chosen = rightDir;
+		float chosenClear = rightClear;
+		if (side == 1)
+		{
+			chosen = leftDir;
+			chosenClear = leftClear;
+		}
+		if (chosenClear < 3.5)
+		{
+			vector alternate = leftDir;
+			float alternateClear = leftClear;
+			if (side == 1)
+			{
+				alternate = rightDir;
+				alternateClear = rightClear;
+			}
+			if (alternateClear > chosenClear + 1.0)
+			{
+				chosen = alternate;
+				m_iCgsFollowAvoidSide = -side;
+				m_fCgsFollowAvoidTime = 1.5;
+			}
+		}
+		// When both sides are blocked, slow the driver using existing stuck recovery.
+		return chosen * toTarget.Length();
+	}
+
 
 	//------------------------------------------------------------------------------------------------
 	protected CGS_MechBrainComponent CgsBrain()
 	{
-		if (!m_bCgsBrainLooked)
-		{
+		// Re-query while missing. Prefab component initialization can precede
+		// or follow the AI crew's first tick; caching a null here permanently
+		// disables both autonomous movement and weapons for an empty mech.
+		if (!m_pCgsBrain)
 			m_pCgsBrain = CGS_MechBrainComponent.Find(GetOwner());
-			m_bCgsBrainLooked = true;
-		}
 		return m_pCgsBrain;
 	}
 
@@ -28,6 +118,9 @@ modded class BFA_MechAICrewComponent
 		CGS_MechBrainComponent brain = CgsBrain();
 		if (!brain || !brain.DrivesEmptySeat() || !m_pMovement)
 		{
+			m_bCgsFollowMoving = false;
+			m_fCgsFollowForward = 0;
+			m_fCgsFollowTurn = 0;
 			super.TickDriver(dt);
 			return;
 		}
@@ -37,8 +130,22 @@ modded class BFA_MechAICrewComponent
 		IEntity driver = m_pCore.GetStationOccupant("DRIVER");
 		if (driver)
 		{
+			// Player takeover/AI driver uses its own steering, never stale companion input.
+			m_bCgsFollowMoving = false;
+			m_fCgsFollowForward = 0;
+			m_fCgsFollowTurn = 0;
 			if (driver != brain.GetPilot())
 			{
+				// A real player has exclusive movement control. Calling the base AI TickDriver
+				// every frame would send STOP commands over the player's own inputs.
+				if (!BFA_MechMovementComponent.IsAIControlled(driver))
+				{
+					if (!m_bCgsPlayerDriving)
+						StopDriver(); // release prior AI movement only once at handoff
+					m_bCgsPlayerDriving = true;
+					return;
+				}
+				m_bCgsPlayerDriving = false;
 				super.TickDriver(dt);
 				return;
 			}
@@ -51,11 +158,13 @@ modded class BFA_MechAICrewComponent
 			}
 		}
 
+		m_bCgsPlayerDriving = false;
 		IEntity owner = GetOwner();
 		vector position = owner.GetOrigin();
 
-		// Fight first (advance / strafe / back off), exactly like an AI driver would.
-		if (m_bCombatMovement && TickCombatMovement(driver, position, dt))
+		// Autonomous combat movement stays enabled for ordinary AI mechs.
+		// Companion orders prioritize staying near the player; AI gunners still fight.
+		if (!brain.CompanionOwnsMovement() && m_bCombatMovement && TickCombatMovement(driver, position, dt))
 			return;
 
 		vector destination;
@@ -63,11 +172,27 @@ modded class BFA_MechAICrewComponent
 		string label;
 		if (!brain.GetDestination(position, dt, GetMechFaction(), destination, arrive, label))
 		{
+			m_bCgsFollowMoving = false;
+			m_fCgsFollowForward = 0;
+			m_fCgsFollowTurn = 0;
 			DriverStatus("brain - " + label);
 			StopDriver();
 			return;
 		}
 
+		if (brain.IsCompanionFollowing() && m_bDebug)
+		{
+			// This path prints at most once every 2 seconds per AI crew component.
+			m_fCgsCompanionDiagTimer -= dt;
+			if (m_fCgsCompanionDiagTimer <= 0)
+			{
+				m_fCgsCompanionDiagTimer = 2.0;
+				float distance = vector.Distance(position, destination);
+				Physics body = owner.GetPhysics();
+				bool dynamicBody = body && body.IsDynamic();
+				Print(string.Format("[CGS FOLLOW DRIVER] distance=%1 arrive=%2 stationOccupant=%3 physicsDynamic=%4 inputBefore=%5 destination=%6", distance, arrive, driver, dynamicBody, m_pMovement.GetForwardInput(), destination));
+			}
+		}
 		CgsDriveTo(position, destination, arrive, label, dt);
 	}
 
@@ -80,14 +205,52 @@ modded class BFA_MechAICrewComponent
 		toTarget[1] = 0;
 		float distance = toTarget.Length();
 
-		if (distance <= arrive)
+		CGS_MechBrainComponent brain = CgsBrain();
+		bool follow = brain && brain.IsCompanionFollowing() && label == "following player";
+		float stopRadius = Math.Max(arrive, 2.0);
+		// Preserve the real distance for arrival, then route the steering vector
+		// around nearby obstacles rather than continuously driving at a wall.
+		if (follow && distance > stopRadius)
+			toTarget = CgsFollowAvoidObstacle(position, toTarget, dt);
+
+		if (follow)
 		{
-			DriverStatus(string.Format("brain - holding, reached %1", label));
-			StopDriver();
-			return;
+			// Do not alternate GO / STOP whenever a walking player's distance
+			// fluctuates by a few centimetres around the stop radius.
+			// Stop at 8m, and only resume when the owner is 12m+ away (default).
+			float resumeRadius = stopRadius + 4.0;
+			if (!m_bCgsFollowMoving && distance >= resumeRadius)
+				m_bCgsFollowMoving = true;
+			else if (m_bCgsFollowMoving && distance <= stopRadius)
+				m_bCgsFollowMoving = false;
+
+			if (!m_bCgsFollowMoving)
+			{
+				m_fCgsFollowForward = 0;
+				m_fCgsFollowTurn = 0;
+				DriverStatus("brain - companion holding inside follow radius");
+				StopDriver();
+				return;
+			}
+		}
+		else
+		{
+			// Guard, patrol, hunt and player handoff should never inherit follow state.
+			m_bCgsFollowMoving = false;
+			m_fCgsFollowForward = 0;
+			m_fCgsFollowTurn = 0;
+			if (distance <= stopRadius)
+			{
+				DriverStatus(string.Format("brain - holding, reached %1", label));
+				StopDriver();
+				return;
+			}
 		}
 
-		DriverStatus(string.Format("brain - %1, %2 m away", label, distance));
+		if (follow)
+			DriverStatus("brain - companion smoothly following player");
+		else
+			DriverStatus(string.Format("brain - %1, %2 m away", label, distance));
 		m_bDriverActive = true;
 
 		vector local = owner.VectorToLocal(toTarget);
@@ -102,16 +265,47 @@ modded class BFA_MechAICrewComponent
 			forward = 0.4;
 
 		bool sprint = m_fSprintDistance > 0 && distance > m_fSprintDistance && absError < 15.0;
-
 		CalibrateTurnSign(absError, Math.AbsFloat(turn), dt);
-		UpdateStuck(position, forward, dt);
 
+		if (follow)
+		{
+			// Slow down over the final 9m instead of charging at full speed
+			// until the distance suddenly falls below the 8m stop threshold.
+			float remaining = Math.Max(distance - stopRadius, 0.0);
+			float approachSpeed = Math.Clamp(remaining / 9.0, 0.0, 1.0) * 0.9;
+			forward = Math.Min(forward, approachSpeed);
+			// Companion FOLLOW should not start sprinting as its owner walks away.
+			sprint = false;
+		}
+
+		UpdateStuck(position, forward, dt);
 		if (m_fReverseTime > 0)
 		{
 			m_fReverseTime -= dt;
 			forward = -0.6;
 			turn = 0.7 * m_fTurnSign;
 			sprint = false;
+		}
+
+		if (follow && m_fReverseTime <= 0)
+		{
+			// Ease acceleration, braking and turning over several AI ticks.
+			// Faster braking allows the mech to settle near the owner without
+			// oscillating; an idle player never receives these inputs.
+			float speedResponse = 2.6;
+			if (forward < m_fCgsFollowForward)
+				speedResponse = 5.0;
+			float speedAlpha = Math.Clamp(dt * speedResponse, 0.0, 1.0);
+			float turnAlpha = Math.Clamp(dt * 4.0, 0.0, 1.0);
+			m_fCgsFollowForward += (forward - m_fCgsFollowForward) * speedAlpha;
+			m_fCgsFollowTurn += (turn - m_fCgsFollowTurn) * turnAlpha;
+			forward = m_fCgsFollowForward;
+			turn = m_fCgsFollowTurn;
+		}
+		else if (!follow)
+		{
+			m_fCgsFollowForward = 0;
+			m_fCgsFollowTurn = 0;
 		}
 
 		m_pMovement.ServerSetDriverInput(forward, 0, turn, sprint, -1);
@@ -125,6 +319,8 @@ modded class BFA_MechAICrewComponent
 			return super.IsCombatLeashed(driver, position);
 
 		CGS_MechBrainComponent brain = CgsBrain();
+		if (brain && brain.CompanionOwnsMovement())
+			return true; // companion movement must not chase enemies off the follow/guard order
 		return brain && brain.IsBeyondLeash(position);
 	}
 

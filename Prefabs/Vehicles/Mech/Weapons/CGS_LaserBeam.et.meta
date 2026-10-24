@@ -1,5 +1,5 @@
 MetaFileClass {
- Name "{254289B9C09904AC}Prefabs/Vehicles/Wheeled/BRDM2/BRDM2.et"
+ Name "{F9F15A6E70B2C046}Prefabs/Vehicles/Mech/Weapons/CGS_LaserBeam.et"
  Configurations {
   EntityTemplateResourceClass PC {
   }
